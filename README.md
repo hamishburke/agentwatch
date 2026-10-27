@@ -1,5 +1,7 @@
 # agentwatch
 
+<img width="1705" height="583" alt="image" src="https://github.com/user-attachments/assets/4770c761-1fe2-42ff-bffe-2a16dceaddfb" />
+
 A terminal view of what your Claude Code and Codex sessions are doing, so you can see at a glance which one needs you, which ones are busy, and what each is busy with.
 
 No dependencies. Node 18.17 or newer.
