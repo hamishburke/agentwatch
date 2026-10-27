@@ -19,6 +19,7 @@ const HELP = `agentwatch: one terminal view of what your Claude Code and Codex s
 
   Options for the live view and snapshot:
     --file <path>            read events from a different log
+    --close-idle <minutes>   close sessions that have waited on you this long (live view only)
 `;
 
 async function main() {
@@ -46,6 +47,11 @@ async function main() {
     const stop = follow(flag('file') || LOG, (e) => apply(store, e));
     stop();
     snapshotTranscripts(store, (e) => apply(store, e));
+    const { listProcesses, isSameProcess } = await import('../src/procs.js');
+    const { markEnded } = await import('../src/state.js');
+    const live = [...store.sessions.values()].filter((s) => s.pid && s.status !== 'ended');
+    const procs = await listProcesses([...new Set(live.map((s) => s.pid))]);
+    if (procs) for (const s of live) if (!isSameProcess(s, procs.get(s.pid))) markEnded(s, Date.now(), 'gone', 'process exited without ending the session');
     const ui = { view: 'list', selected: null, top: 0, showAll: rest.includes('--all'), bell: false };
     const lines = render(ui, store, Number(flag('width')) || process.stdout.columns || 100, Number(flag('height')) || 40);
     return console.log(lines.join('\n'));
@@ -66,9 +72,14 @@ async function main() {
     demo = (await import('../src/demo.js')).startDemo();
     file = demo.file;
   }
+  const closeIdleMin = Number(flag('close-idle')) || 0;
+  if (flag('close-idle') !== undefined && !(closeIdleMin > 0)) {
+    console.error('--close-idle takes a number of minutes, e.g. --close-idle 90');
+    process.exit(1);
+  }
   follow(file, (e) => apply(store, e));
   const { runTui } = await import('../src/tui.js');
-  runTui(store, { onExit: () => demo?.stop() });
+  runTui(store, { onExit: () => demo?.stop(), closeIdleMin });
 }
 
 main().catch((err) => {
