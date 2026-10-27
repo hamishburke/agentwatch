@@ -8,6 +8,9 @@ export const PHASES = {
   run: { label: 'running', color: 'magenta' },
   plan: { label: 'planning', color: 'cyan' },
   delegate: { label: 'delegating', color: 'cyan' },
+  // A skill keeps the cyan of the agent's own decisions but gets its own mark, so
+  // the strip distinguishes "ran a procedure" from planning or delegating.
+  skill: { label: 'using skill', color: 'cyan', bold: true, mark: '▚' },
   other: { label: 'working', color: 'gray' },
 };
 
@@ -15,6 +18,7 @@ const EXPLORE_TOOLS = /^(Read|Glob|Grep|LS|WebFetch|WebSearch|NotebookRead|view_
 const CHANGE_TOOLS = /^(Edit|MultiEdit|Write|NotebookEdit|apply_patch)$/;
 const PLAN_TOOLS = /^(TodoWrite|update_plan|ExitPlanMode|EnterPlanMode)$/;
 const DELEGATE_TOOLS = /^(Task|Agent|spawn_agent)$/;
+const SKILL_TOOLS = /^(Skill|skill|use_skill|skills?\.[A-Za-z_]+)$/;
 const SHELL_TOOLS = /^(Bash|exec_command|shell)$/;
 
 const VERIFY_CMD = [
@@ -44,6 +48,7 @@ export function classify(tool, cmd) {
   if (CHANGE_TOOLS.test(tool)) return 'change';
   if (EXPLORE_TOOLS.test(tool)) return 'explore';
   if (PLAN_TOOLS.test(tool)) return 'plan';
+  if (SKILL_TOOLS.test(tool)) return 'skill';
   if (DELEGATE_TOOLS.test(tool)) return 'delegate';
   if (/^mcp__/.test(tool)) return /(read|get|list|search|find|fetch|query)/i.test(tool) ? 'explore' : 'run';
   return 'other';
@@ -51,6 +56,7 @@ export function classify(tool, cmd) {
 
 const TIMELINE_MAX = 300;
 const LOG_MAX = 300;
+const HOOKS_MAX = 60;
 
 function newSession(e) {
   return {
@@ -75,6 +81,13 @@ function newSession(e) {
     fails: 0,
     plan: null,
     subagents: 0,
+    tp: null,
+    hooks: [],
+    hookSeen: new Set(),
+    hookCount: 0,
+    hookFails: 0,
+    skills: new Map(),
+    skillCount: 0,
     log: [],
     endedAt: null,
     alertAt: 0,
@@ -85,15 +98,33 @@ function setStatus(s, status, ts) {
   if (s.status !== status) { s.status = status; s.statusAt = ts; }
 }
 
+// Transcript-derived notes (hook runs, /commands) arrive after the events that
+// surround them, so the log is kept in time order rather than arrival order.
 function note(s, ts, kind, text) {
-  s.log.push({ ts, kind, text });
+  let i = s.log.length;
+  while (i > 0 && s.log[i - 1].ts > ts) i--;
+  s.log.splice(i, 0, { ts, kind, text });
   if (s.log.length > LOG_MAX) s.log.splice(0, s.log.length - LOG_MAX);
 }
 
 function describe(e, phase) {
   const what = e.target || e.tool;
   if (phase === 'plan' && e.plan) return `updated plan (${e.plan.filter((p) => p.s === 'completed').length}/${e.plan.length} done)`;
+  if (phase === 'skill') return `skill: ${e.skill || what || 'unknown'}`;
   return `${e.tool}  ${what && what !== e.tool ? what : ''}`.trim();
+}
+
+// Skills are worth counting, not just listing: which one, and how often.
+function bumpSkill(s, name) {
+  s.skills.set(name, (s.skills.get(name) || 0) + 1);
+  s.skillCount++;
+}
+
+const HOOK_VERB = { ok: 'ran', failed: 'failed', blocked: 'blocked', cancelled: 'cancelled' };
+
+export function hookLine(h) {
+  const took = h.timedOut ? ` timed out${h.ms != null ? ` after ${h.ms}ms` : ''}` : h.ms != null ? ` ${h.ms}ms` : '';
+  return `${h.event} hook ${h.label} ${HOOK_VERB[h.status] || h.status}${took}`;
 }
 
 export function createStore() {
@@ -108,6 +139,7 @@ export function apply(store, e) {
   s.lastAt = Math.max(s.lastAt, e.ts);
   if (e.cwd) s.cwd = e.cwd;
   if (e.model) s.model = e.model;
+  if (e.tp) s.tp = e.tp;
   if (s.status === 'ended' && e.ev !== 'SessionEnd') s.endedAt = null;
 
   switch (e.ev) {
@@ -137,6 +169,7 @@ export function apply(store, e) {
       }
       if (phase === 'change') for (const f of e.files || []) s.files.set(f, (s.files.get(f) || 0) + 1);
       if (e.plan) s.plan = e.plan;
+      if (e.skill) bumpSkill(s, e.skill);
       if (phase === 'delegate' && s.agent === 'claude') s.subagents++; // Codex reports SubagentStart instead
       note(s, e.ts, phase, describe(e, phase));
       break;
@@ -177,6 +210,38 @@ export function apply(store, e) {
       if (entry.phase === 'delegate' && s.agent === 'claude') s.subagents = Math.max(0, s.subagents - 1);
       if (s.current && s.current.tuid === e.tuid) { s.current.done = true; s.current.ok = ok; s.current.doneAt = e.ts; }
       if (s.status === 'approval' || s.status === 'yourturn') { setStatus(s, 'working', e.ts); s.approval = null; }
+      break;
+    }
+
+    // A hook run, read from the session transcript: it describes the agent's
+    // environment, not the agent's progress, so it never moves the status.
+    case 'HookRun': {
+      const h = e.hook;
+      if (!h || !h.event) break;
+      if (h.id) {
+        if (s.hookSeen.has(h.id)) break;
+        if (s.hookSeen.size > 2000) s.hookSeen.clear();
+        s.hookSeen.add(h.id);
+      }
+      s.hooks.push({ ts: e.ts, ...h });
+      if (s.hooks.length > HOOKS_MAX) s.hooks.splice(0, s.hooks.length - HOOKS_MAX);
+      s.hookCount++;
+      if (h.status !== 'ok') {
+        s.hookFails++;
+        note(s, e.ts, 'fail', hookLine(h));
+      }
+      break;
+    }
+
+    // A /command the developer typed, read from the session transcript.
+    case 'SkillUse': {
+      if (!e.skill) break;
+      if (e.id) {
+        if (s.hookSeen.has(e.id)) break;
+        s.hookSeen.add(e.id);
+      }
+      bumpSkill(s, e.skill);
+      note(s, e.ts, 'skill', `you ran /${e.skill}`);
       break;
     }
 

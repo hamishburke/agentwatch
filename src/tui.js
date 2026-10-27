@@ -1,4 +1,5 @@
-import { PHASES, displayStatus, visibleSessions, planProgress, fmtDuration } from './state.js';
+import { PHASES, displayStatus, visibleSessions, planProgress, fmtDuration, hookLine, apply } from './state.js';
+import { followTranscripts } from './transcript.js';
 import { repoInfo } from './git.js';
 import { tildify } from './paths.js';
 
@@ -20,7 +21,11 @@ const STATUS = {
   idle: { mark: '○', label: 'idle', style: st.gray },
   ended: { mark: '·', label: 'ended', style: st.gray },
 };
-const phaseStyle = (p) => st[(PHASES[p] || PHASES.other).color] || st.gray;
+const phaseStyle = (p) => {
+  const phase = PHASES[p] || PHASES.other;
+  const paint = st[phase.color] || st.gray;
+  return phase.bold ? both(st.bold, paint) : paint;
+};
 
 // ── text measuring ──────────────────────────────────────────────────────────────
 function charWidth(cp) {
@@ -77,8 +82,8 @@ function strip(s, maxLen, now) {
   return items.map((t) => {
     const live = t.ok === null && s.current && s.current.tuid === t.tuid && !s.current.done && displayStatus(s, now) !== 'ended';
     if (t.ok === false) return ['▇', st.red];
-    if (live) return ['▇', both(st.bold, phaseStyle(t.phase))];
-    return ['▇', phaseStyle(t.phase)];
+    if (live) return [phaseMark(t.phase), both(st.bold, phaseStyle(t.phase))];
+    return [phaseMark(t.phase), phaseStyle(t.phase)];
   });
 }
 
@@ -120,6 +125,7 @@ function statsSegs(s) {
   if (s.files.size) out.push([`${s.files.size} file${s.files.size === 1 ? '' : 's'}`, st.dim]);
   out.push([`${s.tools} tool${s.tools === 1 ? '' : 's'}`, st.dim]);
   if (s.fails) out.push([`${s.fails} failed`, st.red]);
+  if (s.skillCount) out.push([`${s.skillCount} skill${s.skillCount === 1 ? '' : 's'}`, phaseStyle('skill')]);
   if (s.subagents) out.push([`${s.subagents} subagent${s.subagents === 1 ? '' : 's'}`, st.cyan]);
   return out.flatMap((seg, i) => (i ? [['   '], seg] : [seg]));
 }
@@ -137,6 +143,30 @@ function changedFiles(s, budget, skip) {
   const two = `${names[0]}, ${names[1]}${more(2)}`;
   if (names.length > 1 && two.length <= budget) return two;
   return names[0] + more(1);
+}
+
+const HOOK_MARK = { ok: '✓', failed: '✗', blocked: '✗', cancelled: '✗' };
+const phaseMark = (p) => (PHASES[p] || {}).mark || '▇';
+
+// Hooks and skills are the agent's own machinery: they explain a turn that
+// behaved oddly, and the line costs nothing when a session has neither.
+function gearLine(s, selected, width) {
+  const skills = [...s.skills.entries()].sort((a, b) => b[1] - a[1]);
+  if (!s.hookCount && !skills.length) return null;
+  const segs = [[selected ? '▌  ' : '   ', st.white]];
+  if (s.hookCount) {
+    segs.push(['hooks  ', st.bold], [`${s.hookCount} run${s.hookCount === 1 ? '' : 's'}`, s.hookFails ? st.red : st.dim]);
+    for (const h of s.hooks.slice(-2)) {
+      const style = h.status === 'ok' ? st.dim : st.red;
+      segs.push(['   '], [h.label, st.dim], [` ${HOOK_MARK[h.status] || '?'}${h.ms != null ? ` ${h.ms}ms` : ''}`, style]);
+    }
+  }
+  if (skills.length) {
+    if (s.hookCount) segs.push(['   ']);
+    const names = skills.slice(0, 3).map(([name, n]) => (n > 1 ? `${name}×${n}` : name)).join(', ');
+    segs.push(['skills  ', st.bold], [names + (skills.length > 3 ? ` +${skills.length - 3}` : ''), phaseStyle('skill')]);
+  }
+  return fit(segs, width);
 }
 
 function card(s, selected, width, now) {
@@ -175,13 +205,15 @@ function card(s, selected, width, now) {
     const trail = files ? [['✎ ', st.yellow], [files, st.dim]] : [];
     lines.push(planSegs.length && trail.length ? line(lead, trail, width) : fit([...lead, ...trail], width));
   }
+  const gear = gearLine(s, selected, width);
+  if (gear) lines.push(gear);
   if (s.prompt) lines.push(fit([[selected ? '▌  ' : '   ', st.white], ['› ' + s.prompt, st.dim]], width));
   return lines;
 }
 
 function legend(width) {
   const segs = [[' ']];
-  for (const p of ['explore', 'change', 'verify', 'run', 'plan']) segs.push(['▇ ', phaseStyle(p)], [PHASES[p].label + '   ', st.dim]);
+  for (const p of ['explore', 'change', 'verify', 'run', 'plan', 'skill']) segs.push([phaseMark(p) + ' ', phaseStyle(p)], [PHASES[p].label + '   ', st.dim]);
   segs.push(['▇ ', st.red], ['failed', st.dim]);
   return fit(segs, width);
 }
@@ -235,7 +267,7 @@ export function renderList(ui, store, width, height, now) {
 }
 
 // ── detail view ─────────────────────────────────────────────────────────────────
-const KIND_STYLE = { prompt: st.white, approval: both(st.bold, st.red), fail: st.red, done: st.cyan, session: st.gray };
+const KIND_STYLE = { prompt: st.white, approval: both(st.bold, st.red), fail: st.red, done: st.cyan, session: st.gray, skill: phaseStyle('skill') };
 
 function wrap(text, width, maxLines) {
   const words = clean(text).split(/\s+/);
@@ -304,6 +336,22 @@ export function renderDetail(ui, store, width, height, now) {
   }
   if (mixSegs.length) { out.push(fit([['   '], ...mixSegs], width)); out.push(''); }
 
+  // What the agent's own machinery did: hook runs come from the session
+  // transcript, so they are the one thing the event log never sees.
+  if (s.hooks.length) {
+    out.push(fit([['   Hooks  ', st.bold], [`${s.hookCount} run${s.hookCount === 1 ? '' : 's'}`, st.dim], s.hookFails ? [`   ${s.hookFails} not ok`, st.red] : null], width));
+    for (const h of s.hooks.slice(-6)) out.push(fit([['   '], [clock(h.ts) + '  ', st.dim], [hookLine(h), h.status === 'ok' ? st.dim : st.red]], width));
+    if (s.hooks.length > 6) out.push(fit([[`     ${s.hooks.length - 6} earlier`, st.dim]], width));
+    out.push('');
+  }
+  if (s.skills.size) {
+    const skills = [...s.skills.entries()].sort((a, b) => b[1] - a[1]);
+    out.push(fit([['   Skills  ', st.bold], [`${s.skillCount} use${s.skillCount === 1 ? '' : 's'}`, phaseStyle('skill')]], width));
+    for (const [name, n] of skills.slice(0, 8)) out.push(fit([['   '], [String(n).padStart(3) + '  ', st.dim], [name]], width));
+    if (skills.length > 8) out.push(fit([[`     ${skills.length - 8} more`, st.dim]], width));
+    out.push('');
+  }
+
   // Reserve one line for the Activity heading and one for the footer, so a short
   // terminal loses log lines instead of losing the keys that get you out.
   const room = Math.max(0, height - out.length - 2);
@@ -351,7 +399,11 @@ export function runTui(store, { onExit } = {}) {
     ui.selected = list[Math.min(list.length - 1, Math.max(0, i + d))].key;
   };
 
+  // Hook and skill activity lives in each session's transcript, not in the log.
+  const stopTranscripts = followTranscripts(store, (e) => apply(store, e));
+
   const cleanup = () => {
+    stopTranscripts();
     out.write('\x1b[?25h\x1b[?1049l');
     if (process.stdin.isTTY) process.stdin.setRawMode(false);
   };

@@ -42,8 +42,10 @@ async function main() {
 
   if (cmd === 'snapshot') {
     const { render } = await import('../src/tui.js');
+    const { snapshotTranscripts } = await import('../src/transcript.js');
     const stop = follow(flag('file') || LOG, (e) => apply(store, e));
     stop();
+    snapshotTranscripts(store, (e) => apply(store, e));
     const ui = { view: 'list', selected: null, top: 0, showAll: rest.includes('--all'), bell: false };
     const lines = render(ui, store, Number(flag('width')) || process.stdout.columns || 100, Number(flag('height')) || 40);
     return console.log(lines.join('\n'));

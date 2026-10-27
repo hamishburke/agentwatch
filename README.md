@@ -40,11 +40,12 @@ Each card is one session, and reads top to bottom:
 
 - **Who and where** — status, agent and model, repo and branch, and how long since its last event.
 - **What it is doing, and for how long** — `verifying  4m  npm test`. That duration is the age of the current step, so a number that keeps climbing is a long command, and one that stops moving while the status turns yellow is a hang. A session that has finished its turn shows how long the turn took instead, and a blocked one shows how long you have been the blocker.
-- **The strip** — one block per tool call, newest on the right, coloured by phase. Reading it left to right tells you the shape of the turn: a run of blue is exploration, yellow is editing, green is tests or builds, red is something that failed.
+- **The strip** — one block per tool call, newest on the right, coloured by phase. Reading it left to right tells you the shape of the turn: a run of blue is exploration, yellow is editing, green is tests or builds, red is something that failed. A `▚` half block is a skill, which Claude Code calls like any other tool.
 - **Plan and files** — how far through its own plan (from `TodoWrite` in Claude Code or `update_plan` in Codex), and the files it has changed. The names need a wide terminal; the count is always in the line above.
+- **Hooks and skills** — `hooks  6 runs  sphinx.sh ✓ 14ms  format.sh ✗ 1330ms   skills  commit, review`. Present only when a session has run a hook or used a skill. Hook runs come from the session's transcript (see below), so this is the one part of a card the event log never holds.
 - **Your last prompt.**
 
-Press enter on a session for the detail view: the full plan, files changed, how the session's effort splits across phases, and a timestamped activity log.
+Press enter on a session for the detail view: the full plan, files changed, how the session's effort splits across phases, every hook run with its status and duration, the skills used and how often, and a timestamped activity log.
 
 Phases are a heuristic on tool names and shell commands, defined in `src/state.js` (`classify` and the regexes above it). If your projects use different test or build commands, add them to `VERIFY_CMD`.
 
@@ -60,9 +61,21 @@ Both agents run a command on lifecycle events and pass it a JSON payload on stdi
 
 The view tails the log and folds events into one record per session. Because the log is just a file, the view can be closed and reopened without losing anything, and sessions that started before you opened it still show up. The log rotates to `events.1.jsonl` at 50 MB.
 
+Skills arrive the same way as tools: Claude Code calls one through a `Skill` tool, so it lands in the log like any other tool call, and a `/command` you type is read from the transcript.
+
+Hooks do not. A hook is told about its own event and nothing else, so agentwatch's hook cannot see the other hooks running beside it — but every hook payload names the session transcript, and Claude Code writes each hook run into it (`hook_success`, `hook_non_blocking_error`, `hook_error_during_execution`, `hook_cancelled`, with the command, the event and the duration). So the view follows the transcript itself:
+
+```
+Claude Code transcript ─▶ agentwatch (TUI)   hook runs, /commands
+```
+
+That keeps the hook as cheap as before: it records the transcript path and nothing more. Agentwatch's own hook runs are filtered out, since you are watching your hooks, not this one. Codex writes hook runs to its rollout file too, which is a waiting follow-up.
+
 ## Privacy
 
 Everything stays on your machine in `~/.agentwatch/`. The log holds prompts, shell commands and file paths, each cut to a few hundred characters. It doesn't store file contents or tool output. Delete the folder whenever you like.
+
+The transcript the view reads is the agent's own, not a copy: it is read from the last megabyte, never written to, and only hook and `/command` lines are kept.
 
 ## Options
 

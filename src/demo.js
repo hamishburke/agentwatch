@@ -21,6 +21,9 @@ export function startDemo() {
   const tool = (tool, extra = {}, ok = true, ms = 900) => ({ tool, extra, ok, ms });
 
   const plan = (done, steps) => steps.map((t, i) => ({ t, s: i < done ? 'completed' : i === done ? 'in_progress' : 'pending' }));
+  // Hook runs only exist for Claude in the demo: Codex records them for real, but
+  // the view doesn't read them yet, and the demo shouldn't show what it can't.
+  const hooks = (event, command, status = 'ok', ms = 12) => ({ event, label: command.split('/').pop(), status, ms });
   const navSteps = ['Find where the nav and hero overlap', 'Fix the header height at small breakpoints', 'Run the visual tests', 'Tidy up the old media query'];
 
   const scripts = [
@@ -29,6 +32,7 @@ export function startDemo() {
       prompt: 'The nav overlaps the hero on mobile. Fix it and make sure the visual tests still pass.',
       steps: [
         tool('TodoWrite', { plan: plan(0, navSteps) }, true, 600),
+        tool('Skill', { skill: 'commit', target: 'commit' }, true, 900),
         tool('Grep', { target: 'position: fixed  in src' }),
         tool('Read', { files: ['src/components/Header.tsx'], target: 'src/components/Header.tsx' }),
         tool('Read', { files: ['src/components/Hero.tsx'], target: 'src/components/Hero.tsx' }),
@@ -48,6 +52,7 @@ export function startDemo() {
         tool('TodoWrite', { plan: plan(4, navSteps) }, true, 500),
       ],
       final: 'Fixed: the header now uses a fixed height below 640px and the hero offsets by it. Visual tests pass.',
+      hooks: [hooks('UserPromptSubmit', '~/.claude/hooks/sphinx.sh', 'ok', 14), hooks('PreToolUse', '~/.claude/hooks/guard.sh', 'ok', 4), hooks('Stop', '~/.claude/hooks/format.sh', 'failed', 8)],
       rest: 9000,
     },
     {
@@ -89,6 +94,9 @@ export function startDemo() {
   function play(sc) {
     const base = { agent: sc.agent, sid: sc.sid, cwd: sc.cwd, model: sc.model };
     write({ ...base, ev: 'UserPromptSubmit', prompt: sc.prompt });
+    for (const h of sc.hooks || []) {
+      write({ ...base, ev: 'HookRun', hook: { id: `demo_hook_${++n}`, event: h.event, label: h.label, status: h.status, ms: h.ms } });
+    }
     let i = 0;
     const next = () => {
       if (i >= sc.steps.length) {

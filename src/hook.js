@@ -76,6 +76,11 @@ export function summariseTool(tool, ti = {}) {
     r.target = r.files.join(', ');
     return r;
   }
+  if (tool === 'Skill' || tool === 'skill') {
+    r.skill = cut(ti.skill ?? ti.name ?? ti.command, 60);
+    if (r.skill) r.target = r.skill;
+    return r;
+  }
   const file = ti.file_path ?? ti.notebook_path ?? (['Read', 'Edit', 'Write', 'MultiEdit', 'LS'].includes(tool) ? ti.path : undefined);
   if (file) { r.files = [String(file)]; r.target = String(file); return r; }
   const plan = normalisePlan(tool, ti);
@@ -117,6 +122,9 @@ export function normalise(agent, p) {
     cwd: p.cwd,
     model: p.model,
   };
+  // Neither agent reports its other hooks, but both name the session transcript,
+  // which records them; the view reads it from here.
+  if (typeof p.transcript_path === 'string') e.tp = p.transcript_path;
   if (p.tool_name) {
     e.tool = p.tool_name;
     e.tuid = p.tool_use_id;
