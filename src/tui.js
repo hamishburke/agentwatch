@@ -1,6 +1,7 @@
-import { PHASES, displayStatus, visibleSessions, planProgress, fmtDuration, hookLine, apply } from './state.js';
+import { PHASES, displayStatus, visibleSessions, planProgress, fmtDuration, hookLine, apply, markEnded, runningSubagents, subagentState, subLabel } from './state.js';
 import { followTranscripts } from './transcript.js';
 import { repoInfo } from './git.js';
+import { listProcesses, isSameProcess, closeSession } from './procs.js';
 import { tildify } from './paths.js';
 
 // ── styling ─────────────────────────────────────────────────────────────────────
@@ -81,9 +82,11 @@ function strip(s, maxLen, now) {
   const items = maxLen > 0 ? s.timeline.slice(-maxLen) : [];
   return items.map((t) => {
     const live = t.ok === null && s.current && s.current.tuid === t.tuid && !s.current.done && displayStatus(s, now) !== 'ended';
-    if (t.ok === false) return ['▇', st.red];
-    if (live) return [phaseMark(t.phase), both(st.bold, phaseStyle(t.phase))];
-    return [phaseMark(t.phase), phaseStyle(t.phase)];
+    const old = t.turn !== undefined && t.turn !== s.turn;
+    const paint = t.ok === false ? st.red : phaseStyle(t.phase);
+    const mark = t.ok === false ? '▇' : phaseMark(t.phase);
+    if (live) return [mark, both(st.bold, paint)];
+    return [mark, old ? both(st.dim, paint) : paint];
   });
 }
 
@@ -101,9 +104,8 @@ function activityLine(s, status, now) {
   }
   if (status === 'ended') return [[ind], [`ended ${ago(now - (s.endedAt || s.lastAt))}`, st.gray]];
   if (status === 'yourturn' || status === 'idle') {
-    const lead = status === 'idle'
-      ? `idle for ${fmtDuration(now - s.lastAt)}`
-      : s.lastTurnMs != null ? `turn finished in ${fmtDuration(s.lastTurnMs)}` : 'turn finished';
+    const waited = `waiting on you ${fmtDuration(now - s.statusAt)}`;
+    const lead = s.lastTurnMs != null ? `${waited} · turn took ${fmtDuration(s.lastTurnMs)}` : waited;
     return [[ind], [lead, status === 'idle' ? st.gray : st.cyan], s.lastMsg ? ['  ' + firstLine(s.lastMsg), st.dim] : null];
   }
   const quiet = status === 'quiet' ? st.yellow : st.dim;
@@ -120,13 +122,10 @@ function activityLine(s, status, now) {
   return [[ind], [phase.label.padEnd(11), phaseStyle(c.phase)], duration(c.at, now, quiet), target ? [target] : null];
 }
 
-function statsSegs(s) {
+function alertSegs(s) {
   const out = [];
-  if (s.files.size) out.push([`${s.files.size} file${s.files.size === 1 ? '' : 's'}`, st.dim]);
-  out.push([`${s.tools} tool${s.tools === 1 ? '' : 's'}`, st.dim]);
-  if (s.fails) out.push([`${s.fails} failed`, st.red]);
-  if (s.skillCount) out.push([`${s.skillCount} skill${s.skillCount === 1 ? '' : 's'}`, phaseStyle('skill')]);
-  if (s.subagents) out.push([`${s.subagents} subagent${s.subagents === 1 ? '' : 's'}`, st.cyan]);
+  const turnFails = s.timeline.filter((t) => t.ok === false && t.turn === s.turn).length;
+  if (turnFails) out.push([`${turnFails} failed this turn`, st.red]);
   return out.flatMap((seg, i) => (i ? [['   '], seg] : [seg]));
 }
 
@@ -169,6 +168,46 @@ function gearLine(s, selected, width) {
   return fit(segs, width);
 }
 
+const SUB_LINES = 3;
+
+function subLine(a, selected, width, now, parentBranch) {
+  const state = subagentState(a, now);
+  const gutter = [selected ? '▌  ' : '   ', st.white];
+  const branch = repoInfo(a.cwd).branch;
+  const where = branch && branch !== parentBranch ? ['  on ' + branch, st.dim] : null;
+  if (state === 'done') {
+    return line([gutter, ['↳ ✓ ', st.dim], [subLabel(a), st.dim]], [[`done in ${fmtDuration(a.endedAt - a.startedAt)}`, st.dim]], width);
+  }
+  const c = a.current;
+  let doing;
+  if (state === 'quiet') doing = [[`quiet ${fmtDuration(now - a.lastAt)}  `, st.yellow]];
+  else if (!c) doing = [['starting  ', st.dim]];
+  else if (c.done) doing = [['thinking ', st.dim], [fmtDuration(now - (c.doneAt || c.at)), st.dim]];
+  else doing = [[(PHASES[c.phase] || PHASES.other).label + ' ', phaseStyle(c.phase)], [fmtDuration(now - c.at) + '  ', st.dim], [c.target || c.tool]];
+  return line(
+    [gutter, ['↳ ', phaseStyle('delegate')], [(a.type || 'subagent') + '  ', both(st.bold, phaseStyle('delegate'))], a.desc ? [a.desc + '   ', null] : null, ...doing, where].filter(Boolean),
+    [[a.background ? 'background ' : '', st.gray], [fmtDuration(now - a.startedAt), st.dim]],
+    width,
+  );
+}
+
+// Running subagents first, then the ones that finished this turn, within SUB_LINES.
+function subLines(s, selected, width, now) {
+  const running = runningSubagents(s, now).sort((x, y) => x.startedAt - y.startedAt);
+  const finished = [...s.agents.values()].filter((a) => a.endedAt && a.turn === s.turn && a.tools).sort((x, y) => y.endedAt - x.endedAt);
+  const shown = [...running, ...finished];
+  const room = shown.length > SUB_LINES ? SUB_LINES - 1 : SUB_LINES;
+  const branch = repoInfo(s.cwd).branch;
+  const lines = shown.slice(0, room).map((a) => subLine(a, selected, width, now, branch));
+  const rest = shown.slice(room);
+  if (rest.length) {
+    const r = rest.filter((a) => !a.endedAt).length;
+    const text = [r && `${r} running`, rest.length - r && `${rest.length - r} done`].filter(Boolean).join(', ');
+    lines.push(fit([[selected ? '▌  ' : '   ', st.white], [`↳ +${rest.length} more subagents (${text})`, st.dim]], width));
+  }
+  return lines;
+}
+
 function card(s, selected, width, now) {
   const status = displayStatus(s, now);
   const S = STATUS[status];
@@ -183,12 +222,13 @@ function card(s, selected, width, now) {
     width,
   ));
   lines.push(fit([[selected ? '▌' : ' ', st.white], ...activityLine(s, status, now).filter(Boolean).map((seg, i) => (i === 0 ? [seg[0].slice(1)] : seg))], width));
+  lines.push(...subLines(s, selected, width, now));
 
-  const stats = statsSegs(s);
-  const statsW = stats.reduce((n, [t]) => n + textWidth(t), 0);
-  const stripLen = Math.max(0, Math.min(60, width - 3 - statsW - 3));
+  const alerts = alertSegs(s);
+  const alertsW = alerts.reduce((n, [t]) => n + textWidth(t), 0);
+  const stripLen = Math.max(0, Math.min(80, width - 3 - (alertsW ? alertsW + 3 : 0)));
   const bar = strip(s, stripLen, now);
-  lines.push(fit([[selected ? '▌  ' : '   ', st.white], ...bar, bar.length ? ['   '] : null, ...stats], width));
+  if (bar.length || alerts.length) lines.push(fit([[selected ? '▌  ' : '   ', st.white], ...bar, bar.length && alerts.length ? ['   '] : null, ...alerts], width));
 
   // How far through its plan, and which files it has touched: one line, two answers.
   // The plan gets the width it wants first, since it is the agent's own statement of
@@ -197,12 +237,13 @@ function card(s, selected, width, now) {
   const plan = planProgress(s.plan);
   const planSegs = plan && plan.done < plan.total ? [[`plan ${plan.done}/${plan.total}  `, st.cyan], [plan.step || '']] : [];
   const planW = planSegs.reduce((n, [t]) => n + textWidth(t), 0);
-  const budget = Math.min(Math.floor(width * 0.5), width - planW - 6);
+  const count = s.files.size ? `${s.files.size} file${s.files.size === 1 ? '' : 's'}` : '';
+  const budget = Math.min(Math.floor(width * 0.5), width - planW - 6) - count.length - 4;
   const editing = s.current && !s.current.done ? s.current.target : '';
   const files = width >= 70 && budget > 12 ? changedFiles(s, budget, editing) : '';
-  if (planSegs.length || files) {
+  if (planSegs.length || count) {
     const lead = [[selected ? '▌  ' : '   ', st.white], ...planSegs];
-    const trail = files ? [['✎ ', st.yellow], [files, st.dim]] : [];
+    const trail = count ? [['✎ ', st.yellow], [count, st.yellow], files ? ['  ' + files, st.dim] : null].filter(Boolean) : [];
     lines.push(planSegs.length && trail.length ? line(lead, trail, width) : fit([...lead, ...trail], width));
   }
   const gear = gearLine(s, selected, width);
@@ -211,6 +252,23 @@ function card(s, selected, width, now) {
   return lines;
 }
 
+const END_REASON = { gone: 'process gone', replaced: 'replaced', clear: 'cleared', logout: 'logged out', prompt_input_exit: 'exited' };
+
+function compactRow(s, selected, width, now) {
+  const status = displayStatus(s, now);
+  const S = STATUS[status];
+  const repo = repoInfo(s.cwd);
+  const since = status === 'ended' ? `${fmtDuration(now - s.lastAt)} ago` : fmtDuration(now - s.statusAt);
+  const why = status === 'ended' ? END_REASON[s.endReason] || '' : s.pid ? '' : 'no pid yet';
+  return line(
+    [selected ? ['▌ ', st.white] : ['  '], [S.mark + ' ', S.style], [`${S.label} ${since}`.padEnd(17), S.style], [s.agent.padEnd(8), st.dim], [repo.name, selected ? st.bold : null], repo.branch ? ['  ' + repo.branch, st.dim] : null, s.prompt ? ['   › ' + firstLine(s.prompt), st.dim] : null],
+    why ? [[why, st.gray]] : [],
+    width,
+  );
+}
+
+const isActive = (st) => st !== 'idle' && st !== 'ended';
+
 function legend(width) {
   const segs = [[' ']];
   for (const p of ['explore', 'change', 'verify', 'run', 'plan', 'skill']) segs.push([phaseMark(p) + ' ', phaseStyle(p)], [PHASES[p].label + '   ', st.dim]);
@@ -218,7 +276,7 @@ function legend(width) {
   return fit(segs, width);
 }
 
-function header(store, sessions, width, now) {
+function header(ui, sessions, width, now) {
   const counts = {};
   for (const s of sessions) { const k = displayStatus(s, now); counts[k] = (counts[k] || 0) + 1; }
   const right = [];
@@ -227,6 +285,8 @@ function header(store, sessions, width, now) {
   add('working', 'working');
   add('quiet', 'quiet');
   add('yourturn', 'your turn');
+  add('idle', 'idle');
+  if (ui.closeIdleMin) right.push([`closing idle after ${fmtDuration(ui.closeIdleMin * 60_000)}   `, st.gray]);
   right.push([clock(now), st.dim]);
   return line([[' agentwatch', st.bold]], right, width);
 }
@@ -235,7 +295,7 @@ export function renderList(ui, store, width, height, now) {
   const all = visibleSessions(store, now, true);
   const sessions = visibleSessions(store, now, ui.showAll);
   const hidden = all.length - sessions.length;
-  const out = [header(store, sessions, width, now), legend(width), ''];
+  const out = [header(ui, sessions, width, now), legend(width), ''];
 
   if (!sessions.length) {
     out.push(fit([['   No agent sessions to show.', st.bold]], width));
@@ -244,26 +304,46 @@ export function renderList(ui, store, width, height, now) {
   }
 
   if (!sessions.some((s) => s.key === ui.selected)) ui.selected = sessions[0]?.key ?? null;
-  const cards = sessions.map((s) => ({ key: s.key, lines: card(s, s.key === ui.selected, width, now) }));
+  let divided = false;
+  const cards = sessions.map((s) => {
+    const selected = s.key === ui.selected;
+    if (isActive(displayStatus(s, now))) return { key: s.key, lines: [...card(s, selected, width, now), ''] };
+    const lines = [compactRow(s, selected, width, now)];
+    if (!divided) {
+      divided = true;
+      const n = sessions.filter((x) => !isActive(displayStatus(x, now))).length;
+      lines.unshift(fit([[`   ── idle and ended  ${n} ──`, st.dim]], width));
+    }
+    return { key: s.key, lines };
+  });
   const avail = Math.max(1, height - out.length - 2);
   const sel = Math.max(0, cards.findIndex((c) => c.key === ui.selected));
   ui.top = Math.min(ui.top || 0, sel);
-  const span = (from, to) => cards.slice(from, to + 1).reduce((n, c) => n + c.lines.length + 1, 0);
+  const span = (from, to) => cards.slice(from, to + 1).reduce((n, c) => n + c.lines.length, 0);
   while (ui.top < sel && span(ui.top, sel) > avail) ui.top++;
 
   let used = 0;
   if (ui.top > 0) { out.push(fit([[`   ↑ ${ui.top} more`, st.dim]], width)); used++; }
   for (let i = ui.top; i < cards.length; i++) {
-    const need = cards[i].lines.length + 1;
+    const need = cards[i].lines.length;
     if (used + need > avail) { out.push(fit([[`   ↓ ${cards.length - i} more`, st.dim]], width)); used++; break; }
-    out.push(...cards[i].lines, '');
+    out.push(...cards[i].lines);
     used += need;
   }
   if (out.length > height - 1) out.length = Math.max(0, height - 1);
   while (out.length < height - 1) out.push('');
-  const footer = [['↑↓', st.bold], [' select   ', st.dim], ['enter', st.bold], [' details   ', st.dim], ['a', st.bold], [ui.showAll ? ' hide old   ' : ` show all${hidden ? ` (${hidden} hidden)` : ''}   `, st.dim], ['b', st.bold], [` bell ${ui.bell ? 'on' : 'off'}   `, st.dim], ['q', st.bold], [' quit', st.dim]];
-  out.push(fit([[' '], ...footer], width));
+  const key = (k, label, optional) => ({ segs: [[k, st.bold], [` ${label}   `, st.dim]], optional });
+  const keys = [key('↑↓', 'select'), key('enter', 'details'), key('x', 'close'), key('X', 'close idle', true), key('a', ui.showAll ? 'hide old' : `show all${hidden ? ` (${hidden} hidden)` : ''}`), key('b', `bell ${ui.bell ? 'on' : 'off'}`, true), key('q', 'quit')];
+  const segsOf = (ks) => ks.flatMap((k) => k.segs);
+  const footer = textWidth(segsOf(keys).map(([t]) => t).join('')) + 1 <= width ? segsOf(keys) : segsOf(keys.filter((k) => !k.optional));
+  out.push(bottomLine(ui, footer, width, now));
   return out.slice(0, height);
+}
+
+function bottomLine(ui, keys, width, now) {
+  if (ui.confirm) return fit([[' '], [ui.confirm.text, both(st.bold, st.yellow)], ['   y', st.bold], [' yes   ', st.dim], ['any other key', st.bold], [' no', st.dim]], width);
+  if (ui.flash && now - ui.flash.at < 5000) return fit([[' '], [ui.flash.text, ui.flash.ok ? st.green : st.red]], width);
+  return fit([[' '], ...keys], width);
 }
 
 // ── detail view ─────────────────────────────────────────────────────────────────
@@ -290,7 +370,7 @@ export function renderDetail(ui, store, width, height, now) {
   out.push(line([[' agentwatch', st.bold], ['   esc back', st.dim]], [[clock(now), st.dim]], width));
   out.push('');
   out.push(fit([['   '], [S.mark + ' ' + S.label + '   ', S.style], [s.agent + '   ', st.bold], [repo.name, st.bold], repo.branch ? ['  ' + repo.branch, st.dim] : null], width));
-  out.push(fit([['   '], [tildify(s.cwd) || '', st.dim], s.model ? ['   ' + s.model, st.dim] : null, [`   session ${s.sid}`, st.gray], [`   started ${ago(now - s.startedAt)}`, st.dim]], width));
+  out.push(fit([['   '], [tildify(s.cwd) || '', st.dim], s.model ? ['   ' + s.model, st.dim] : null, [`   session ${s.sid}`, st.gray], s.pid ? [`   pid ${s.pid}`, st.gray] : null, [`   started ${ago(now - s.startedAt)}`, st.dim], s.endReason ? [`   ${END_REASON[s.endReason] || s.endReason}`, st.gray] : null], width));
   out.push(fit(activityLine(s, status, now).filter(Boolean), width));
   out.push('');
   if (s.prompt) {
@@ -336,6 +416,22 @@ export function renderDetail(ui, store, width, height, now) {
   }
   if (mixSegs.length) { out.push(fit([['   '], ...mixSegs], width)); out.push(''); }
 
+  const subs = [...s.agents.values()].filter((a) => a.tools || !a.endedAt).sort((x, y) => y.startedAt - x.startedAt);
+  if (subs.length) {
+    const r = runningSubagents(s, now).length;
+    out.push(fit([['   Subagents  ', st.bold], [`${subs.length}`, phaseStyle('delegate')], r ? [`   ${r} running`, phaseStyle('delegate')] : null], width));
+    const branch = repoInfo(s.cwd).branch;
+    for (const a of subs.slice(0, 6)) {
+      out.push(subLine(a, false, width, now, branch));
+      const mix = Object.entries(a.phases).sort((x, y) => y[1] - x[1]).slice(0, 3).map(([p, n]) => `${PHASES[p].label} ${n}`).join(', ');
+      const facts = [`${a.tools} tool${a.tools === 1 ? '' : 's'}`, mix, a.files.size && `${a.files.size} file${a.files.size === 1 ? '' : 's'} changed`, a.fails && `${a.fails} failed`].filter(Boolean).join('   ');
+      out.push(fit([['       '], [facts, a.fails ? st.red : st.dim]], width));
+      if (a.lastMsg) out.push(fit([['       '], ['“' + firstLine(a.lastMsg) + '”', st.dim]], width));
+    }
+    if (subs.length > 6) out.push(fit([[`     ${subs.length - 6} earlier`, st.dim]], width));
+    out.push('');
+  }
+
   // What the agent's own machinery did: hook runs come from the session
   // transcript, so they are the one thing the event log never sees.
   if (s.hooks.length) {
@@ -365,7 +461,7 @@ export function renderDetail(ui, store, width, height, now) {
   }
   if (out.length > height - 1) out.length = Math.max(0, height - 1);
   while (out.length < height - 1) out.push('');
-  out.push(fit([[' '], ['esc', st.bold], [' back   ', st.dim], ['↑↓', st.bold], [' other sessions   ', st.dim], ['q', st.bold], [' quit', st.dim]], width));
+  out.push(bottomLine(ui, [['esc', st.bold], [' back   ', st.dim], ['↑↓', st.bold], [' other sessions   ', st.dim], ['x', st.bold], [' close   ', st.dim], ['q', st.bold], [' quit', st.dim]], width, now));
   return out.slice(0, height);
 }
 
@@ -374,9 +470,11 @@ export function render(ui, store, width, height, now = Date.now()) {
 }
 
 // ── interactive loop ────────────────────────────────────────────────────────────
-export function runTui(store, { onExit } = {}) {
+const closable = (s, now) => s.pid && s.status !== 'ended' && ['yourturn', 'idle'].includes(displayStatus(s, now)) && !runningSubagents(s, now).length;
+
+export function runTui(store, { onExit, closeIdleMin } = {}) {
   const out = process.stdout;
-  const ui = { view: 'list', selected: null, top: 0, showAll: false, bell: true, live: false, lastAlert: 0 };
+  const ui = { view: 'list', selected: null, top: 0, showAll: false, bell: true, live: false, lastAlert: 0, confirm: null, flash: null, closeIdleMin };
   let lastVersion = -1;
   let lastDraw = 0;
 
@@ -402,6 +500,32 @@ export function runTui(store, { onExit } = {}) {
   // Hook and skill activity lives in each session's transcript, not in the log.
   const stopTranscripts = followTranscripts(store, (e) => apply(store, e));
 
+  const close = async (targets) => {
+    const results = await Promise.all(targets.map(closeSession));
+    const ok = results.filter((r) => r.ok).length;
+    ui.flash = { at: Date.now(), ok: ok === results.length, text: results.length === 1 ? results[0].msg : `closed ${ok} of ${results.length} sessions` };
+    checkProcesses();
+  };
+
+  // A killed or crashed agent never sends SessionEnd, so it would sit at "idle" for good.
+  let checking = false;
+  const checkProcesses = async () => {
+    if (checking) return;
+    checking = true;
+    const live = [...store.sessions.values()].filter((s) => s.pid && s.status !== 'ended');
+    const procs = await listProcesses([...new Set(live.map((s) => s.pid))]);
+    checking = false;
+    if (!procs) return;
+    const now = Date.now();
+    for (const s of live) if (!isSameProcess(s, procs.get(s.pid))) markEnded(s, now, 'gone', 'process exited without ending the session');
+    if (live.length) store.version++;
+    if (!ui.closeIdleMin) return;
+    const stale = [...store.sessions.values()].filter((s) => closable(s, now) && now - s.statusAt > ui.closeIdleMin * 60_000);
+    if (stale.length) close(stale);
+  };
+  checkProcesses();
+  setInterval(checkProcesses, 5000);
+
   const cleanup = () => {
     stopTranscripts();
     out.write('\x1b[?25h\x1b[?1049l');
@@ -418,14 +542,36 @@ export function runTui(store, { onExit } = {}) {
   process.stdin.setRawMode(true);
   process.stdin.resume();
   process.stdin.setEncoding('utf8');
+  const ask = (text, run) => { ui.confirm = { text, run }; };
   process.stdin.on('data', (key) => {
-    if (key === 'q' || key === '\x03') return quit();
+    if (key === '\x03') return quit();
+    if (ui.confirm) {
+      const { run } = ui.confirm;
+      ui.confirm = null;
+      if (key === 'y' || key === 'Y') run();
+      return draw();
+    }
+    if (key === 'q') return quit();
     if (key === '\x1b[A' || key === 'k') move(-1);
     else if (key === '\x1b[B' || key === 'j') move(1);
     else if (key === '\r' || key === '\n' || key === 'l' || key === '\x1b[C') { if (ui.selected) ui.view = 'detail'; }
     else if (key === '\x1b' || key === 'h' || key === '\x1b[D' || key === '\x7f') ui.view = 'list';
     else if (key === 'a') { ui.showAll = !ui.showAll; ui.top = 0; }
     else if (key === 'b') ui.bell = !ui.bell;
+    else if (key === 'x') {
+      const s = store.sessions.get(ui.selected);
+      if (!s || s.status === 'ended') ui.flash = { at: Date.now(), ok: false, text: 'that session has already ended' };
+      else if (!s.pid) ui.flash = { at: Date.now(), ok: false, text: 'no process recorded for this session yet; it sends one with its next prompt' };
+      else {
+        const subs = runningSubagents(s, Date.now()).length;
+        const busy = ['working', 'quiet', 'approval'].includes(displayStatus(s, Date.now())) ? ' It is mid-turn.' : subs ? ` ${subs} subagent${subs === 1 ? ' is' : 's are'} still running.` : '';
+        ask(`Close ${s.agent} in ${repoInfo(s.cwd).name} (pid ${s.pid})?${busy} Unsent prompt text is lost.`, () => close([s]));
+      }
+    } else if (key === 'X') {
+      const idle = [...store.sessions.values()].filter((s) => closable(s, Date.now()) && displayStatus(s, Date.now()) === 'idle');
+      if (!idle.length) ui.flash = { at: Date.now(), ok: false, text: 'no idle sessions with a known process to close' };
+      else ask(`Close ${idle.length} idle session${idle.length === 1 ? '' : 's'} (${idle.map((s) => repoInfo(s.cwd).name).join(', ')})?`, () => close(idle));
+    }
     draw();
   });
 

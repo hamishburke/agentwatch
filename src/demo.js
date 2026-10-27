@@ -33,6 +33,18 @@ export function startDemo() {
       steps: [
         tool('TodoWrite', { plan: plan(0, navSteps) }, true, 600),
         tool('Skill', { skill: 'commit', target: 'commit' }, true, 900),
+        {
+          background: {
+            type: 'Explore', desc: 'Find every place the header height is set',
+            steps: [
+              tool('Grep', { target: 'header-height  in src' }, true, 1500),
+              tool('Read', { files: ['src/styles/tokens.css'], target: 'src/styles/tokens.css' }, true, 1800),
+              tool('Bash', { cmd: 'rg -n "--header-h" src', target: 'rg -n "--header-h" src' }, true, 2500),
+              tool('Read', { files: ['src/components/MobileMenu.tsx'], target: 'src/components/MobileMenu.tsx' }, true, 2200),
+            ],
+            final: 'The height is set in tokens.css and overridden in MobileMenu.tsx.',
+          },
+        },
         tool('Grep', { target: 'position: fixed  in src' }),
         tool('Read', { files: ['src/components/Header.tsx'], target: 'src/components/Header.tsx' }),
         tool('Read', { files: ['src/components/Hero.tsx'], target: 'src/components/Hero.tsx' }),
@@ -107,6 +119,23 @@ export function startDemo() {
       if (step.approval) {
         write({ ...base, ev: 'PermissionRequest', tool: 'Bash', target: step.approval });
         return later(step.ms, next);
+      }
+      if (step.background) {
+        const b = step.background;
+        const tuid = `demo_${++n}`;
+        const agentId = `demo_agent_${n}`;
+        write({ ...base, ev: 'PreToolUse', tool: 'Agent', tuid, target: b.desc, subagentType: b.type, background: true });
+        later(300, () => write({ ...base, ev: 'PostToolUse', tool: 'Agent', tuid, ok: true }));
+        let j = 0;
+        const sub = () => {
+          if (j >= b.steps.length) return write({ ...base, ev: 'SubagentStop', agentId, agentType: b.type, msg: b.final });
+          const t = b.steps[j++];
+          const id = `demo_${++n}`;
+          write({ ...base, ev: 'PreToolUse', tool: t.tool, tuid: id, agentId, agentType: b.type, ...t.extra });
+          later(t.ms, () => { write({ ...base, ev: 'PostToolUse', tool: t.tool, tuid: id, agentId, agentType: b.type, ok: t.ok, ...t.extra }); later(400, sub); });
+        };
+        later(600, sub);
+        return later(500, next);
       }
       if (step.subagent) {
         write({ ...base, ev: 'SubagentStart', agentType: step.subagent });

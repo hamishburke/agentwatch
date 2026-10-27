@@ -3,6 +3,7 @@
 // context), and always exit 0 so the agent is never blocked by the visualiser.
 import fs from 'node:fs';
 import path from 'node:path';
+import { execFileSync } from 'node:child_process';
 import { AW_HOME, LOG, LOG_ROTATE_BYTES } from './paths.js';
 
 const cut = (s, n) => {
@@ -89,7 +90,11 @@ export function summariseTool(tool, ti = {}) {
   else if (tool === 'Glob') r.target = ti.pattern;
   else if (tool === 'WebFetch') r.target = ti.url;
   else if (tool === 'WebSearch') r.target = ti.query;
-  else if (tool === 'Task' || tool === 'Agent') r.target = ti.description || ti.prompt;
+  else if (tool === 'Task' || tool === 'Agent') {
+    r.target = ti.description || ti.prompt;
+    if (ti.subagent_type) r.subagentType = cut(ti.subagent_type, 60);
+    if (ti.run_in_background) r.background = true;
+  }
   else r.target = firstString(ti);
   r.target = cut(r.target, 200);
   return r;
@@ -144,6 +149,22 @@ export function normalise(agent, p) {
   return e;
 }
 
+const PID_EVENTS = new Set(['SessionStart', 'UserPromptSubmit']);
+
+export function agentProcess(agent, from = process.ppid) {
+  if (process.platform === 'win32') return null;
+  let pid = from;
+  for (let i = 0; i < 6 && pid > 1; i++) {
+    const out = execFileSync('ps', ['-o', 'ppid=,lstart=,comm=', '-p', String(pid)], { encoding: 'utf8', timeout: 500 }).trim();
+    const [ppid, ...rest] = out.split(/\s+/);
+    if (rest.length < 6) return null;
+    const name = path.basename(rest.slice(5).join(' ')).replace(/^-/, '');
+    if (name === agent || name.startsWith(`${agent}-`)) return { pid, pstart: rest.slice(0, 5).join(' ') };
+    pid = Number(ppid);
+  }
+  return null;
+}
+
 function append(e) {
   fs.mkdirSync(AW_HOME, { recursive: true });
   try {
@@ -160,7 +181,13 @@ export async function runHook(agent) {
     if (raw.trim()) {
       const p = JSON.parse(raw);
       ev = p?.hook_event_name;
-      if (p && ev && p.session_id) append(normalise(agent, p));
+      if (p && ev && p.session_id) {
+        const e = normalise(agent, p);
+        if (PID_EVENTS.has(ev)) {
+          try { Object.assign(e, agentProcess(agent)); } catch { /* ps missing or slow */ }
+        }
+        append(e);
+      }
     }
   } catch { /* never let the visualiser break the agent */ }
   // Codex treats empty output from these two events as invalid; everything else stays silent.
